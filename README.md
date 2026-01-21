@@ -15,7 +15,7 @@ Claude Code has a ~200K token context window. When you need to analyze:
 
 ## The Solution
 
-RLM treats long contexts as **external environment variables** rather than stuffing them into the prompt. Claude writes Python code to programmatically access, filter, and chunk the context—then spawns sub-agents to process each chunk.
+RLM treats long contexts as **external environment variables** rather than stuffing them into the prompt. Claude writes Python code to programmatically access, filter, and chunk the context—then uses `llm_query()` to analyze each chunk.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -26,16 +26,16 @@ RLM treats long contexts as **external environment variables** rather than stuff
 ┌─────────────────────────────────────────────────────┐
 │  REPL Environment                                   │
 │  ┌───────────────────────────────────────────────┐  │
-│  │ context = "..." (loaded from file)            │  │
-│  │ Write Python to filter/chunk                  │  │
-│  │ Spawn sub-agents for semantic analysis        │  │
+│  │ context = "..." (loaded from file/directory)  │  │
+│  │ llm_query(prompt, model) → API call           │  │
+│  │ print() → observe results                     │  │
 │  └───────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
                          │
             ┌────────────┴────────────┐
             ▼                         ▼
     ┌──────────────┐          ┌──────────────┐
-    │ Sub-agent 1  │          │ Sub-agent N  │
+    │ llm_query 1  │          │ llm_query N  │
     │ (chunk 1)    │   ...    │ (chunk N)    │
     └──────────────┘          └──────────────┘
                          │
@@ -50,128 +50,143 @@ RLM treats long contexts as **external environment variables** rather than stuff
 ```bash
 # Clone to your Claude Code skills directory
 git clone https://github.com/lmor-alt/claude-long-context.git ~/.claude/skills/rlm
+
+# Install the anthropic package (required for llm_query)
+pip install anthropic
+
+# Set your API key
+export ANTHROPIC_API_KEY=your-key
 ```
 
-Or copy manually:
+## Quick Start
+
+### From a Directory (Most Common)
+
 ```bash
-mkdir -p ~/.claude/skills/rlm
-cp -r . ~/.claude/skills/rlm/
+# Initialize from a codebase
+python ~/.claude/skills/rlm/scripts/rlm_repl.py init-dir ~/project --glob "**/*.py" --session myproj
+
+# Execute with LLM support
+python rlm_repl.py exec myproj "
+import re
+funcs = re.findall(r'def (\w+)', context)
+print(f'Found {len(funcs)} functions')
+
+# Use LLM to analyze
+summary = llm_query(f'Summarize these functions: {funcs[:20]}', model='haiku')
+print(summary)
+" --llm
+```
+
+### From a Single File
+
+```bash
+python rlm_repl.py init ~/large_document.txt --session doc1
+python rlm_repl.py exec doc1 "print(len(context))"
 ```
 
 ## Usage
 
-### Slash Command
+### Slash Command (in Claude Code)
 
 ```
 /rlm ~/path/to/large_file.txt "Find all API endpoints and their authentication methods"
 ```
 
-### Auto-Detection
-
-Claude will automatically propose RLM when:
-- Processing files > 100K tokens
-- Analyzing/aggregating across many files
-- Tasks requiring examination of nearly all parts of a large input
-
-### When NOT to Use
-
-- Simple single-file reads < 50K tokens
-- Needle-in-haystack searches (use grep/search instead)
-- Real-time interactive queries
-
-## How It Works
-
-### 1. Initialize Session
+### CLI Commands
 
 ```bash
-python ~/.claude/skills/rlm/scripts/rlm_repl.py init document.txt --session doc1
+# Initialize from file
+python rlm_repl.py init <file_path> [--session SESSION_ID]
+
+# Initialize from directory
+python rlm_repl.py init-dir <directory> [--glob "**/*.py"] [--exclude "tests/*"] [--session SESSION_ID]
+
+# Execute code (add --llm for API calls)
+python rlm_repl.py exec <session_id> "<code>" [--llm]
+
+# Other commands
+python rlm_repl.py info <session_id>      # Show session info
+python rlm_repl.py store <session_id> <var> <value>  # Store a value
+python rlm_repl.py list                   # List active sessions
+python rlm_repl.py cleanup <session_id>   # Clean up session
 ```
 
-### 2. Probe Context Structure
+## Available in REPL
 
-```bash
-python rlm_repl.py exec doc1 "print(len(context)); print(context[:1000])"
-```
+| Name | Description |
+|------|-------------|
+| `context` | The loaded text content |
+| `llm_query(prompt, model)` | Call LLM API (requires `--llm` flag) |
+| `get_llm_stats()` | Returns `{calls, total_tokens}` |
+| `FINAL(answer)` | Mark final answer (string) |
+| `FINAL_VAR(varname)` | Mark final answer (variable) |
 
-### 3. Process with Code
+### llm_query() Function
 
 ```python
-# Split into chunks
-chunks = context.split('\n\n')
-print(f"Found {len(chunks)} chunks")
-
-# Filter relevant sections with regex
-import re
-api_sections = [c for c in chunks if re.search(r'def |@app\.', c)]
-print(f"Found {len(api_sections)} API-related sections")
-```
-
-### 4. Sub-Agent Calls
-
-Claude uses the Task tool to spawn sub-agents for semantic analysis:
-
-```python
-# Claude spawns sub-agents for each chunk that needs understanding
-for chunk in api_sections:
-    summary = llm_query(f"Analyze this API endpoint: {chunk}")
-    results.append(summary)
-```
-
-### 5. Final Answer
-
-```python
-FINAL("Based on analysis, there are 15 API endpoints...")
-# or return a variable
-FINAL_VAR(results_list)
+llm_query(
+    prompt: str,           # The prompt to send
+    model: str = "haiku",  # "haiku", "sonnet", or "opus"
+    max_tokens: int = 2048 # Max response tokens
+) -> str
 ```
 
 ## Core Patterns
 
-### Chunking and Aggregating
-Split → Process each → Synthesize results
-
 ### Filtered Search
-Use regex/string ops to narrow down → LLM for semantic understanding
+Use regex to narrow down, then LLM for semantic understanding:
+
+```python
+import re
+
+# Find relevant sections (cheap)
+matches = re.findall(r'(def |class )\w+', context)
+print(f"Found {len(matches)} definitions")
+
+# Analyze with LLM (expensive but targeted)
+for match in matches[:5]:
+    idx = context.find(match)
+    snippet = context[idx:idx+500]
+    analysis = llm_query(f"Analyze: {snippet}", model="haiku")
+    print(f"{match}: {analysis}")
+```
 
 ### Hierarchical Decomposition
-Split by structure (headers, functions) → Summarize each → Overview
+Split by structure, summarize each, then synthesize:
 
-See [examples/document_analysis.py](examples/document_analysis.py) for a complete workflow.
+```python
+import re
 
-## CLI Reference
+# Split by file markers
+files = re.split(r'=== FILE: (.+?) ===', context)
 
-```bash
-# Initialize session with context file
-python rlm_repl.py init <context_file> [--session SESSION_ID]
+# Summarize each file
+summaries = {}
+for i in range(1, len(files), 2):
+    filename, content = files[i], files[i+1]
+    summaries[filename] = llm_query(f"Summarize: {content[:5000]}", model="haiku")
 
-# Execute Python code in session
-python rlm_repl.py exec <session_id> "<code>"
-
-# Store sub-agent result as variable
-python rlm_repl.py store <session_id> <var_name> "<value>"
-
-# Show session info
-python rlm_repl.py info <session_id>
-
-# List all active sessions
-python rlm_repl.py list
-
-# Clean up session
-python rlm_repl.py cleanup <session_id>
+# Synthesize
+final = llm_query(f"Create overview: {summaries}", model="sonnet")
 ```
 
 ## Cost Awareness
 
-- Each `llm_query()` spawns a sub-agent (costs tokens)
-- Use code for filtering first, LLM for semantic understanding
-- Batch items: 50-200 per sub-call when possible
-- Aim for ~10-50 sub-calls, not thousands
+- Each `llm_query()` call costs tokens
+- Filter with code first, then use LLM for semantic understanding
+- Use haiku (~$0.25/M input) for simple tasks, sonnet for synthesis
+- Stats are printed at the end of each `--llm` execution:
+  ```
+  [LLM Usage] 5 calls, 12,345 tokens
+  ```
 
 ## Requirements
 
 - Claude Code with skills enabled
 - Python 3.8+
-- No external dependencies (uses stdlib only)
+- `anthropic` package (`pip install anthropic`)
+- `ANTHROPIC_API_KEY` environment variable
 
 ## License
 

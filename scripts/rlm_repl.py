@@ -4,16 +4,18 @@ RLM REPL - Recursive Language Model execution environment.
 
 Provides a Python REPL with:
 - `context`: The loaded input text
+- `llm_query(prompt, model)`: Call LLM for semantic analysis
 - Variables persist across executions within a session
-
-Sub-agent calls are handled by Claude using the Task tool, not by this script.
 
 Usage:
     # Initialize session with context file
     python rlm_repl.py init <context_file> [--session SESSION_ID]
 
-    # Execute code in session
-    python rlm_repl.py exec <session_id> "<code>"
+    # Initialize session from directory (combines files matching glob)
+    python rlm_repl.py init-dir <directory> [--glob "**/*.py"] [--session SESSION_ID]
+
+    # Execute code in session (with LLM support)
+    python rlm_repl.py exec <session_id> "<code>" [--llm]
 
     # Get session info
     python rlm_repl.py info <session_id>
@@ -23,20 +25,117 @@ Usage:
 
     # Clean up session
     python rlm_repl.py cleanup <session_id>
+
+Environment:
+    ANTHROPIC_API_KEY: Required for llm_query() calls
 """
 
 import argparse
+import fnmatch
 import json
+import os
 import sys
 import tempfile
 import traceback
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Session storage directory
 SESSION_DIR = Path(tempfile.gettempdir()) / "rlm_sessions"
 SESSION_DIR.mkdir(exist_ok=True)
+
+# LLM query tracking for cost awareness
+_llm_call_count = 0
+_llm_total_tokens = 0
+
+
+def create_llm_query_function(session_id: str) -> Callable:
+    """
+    Create an llm_query function bound to a session.
+
+    Uses Anthropic API directly for sub-agent calls within RLM execution.
+    Requires ANTHROPIC_API_KEY environment variable.
+    """
+    def llm_query(
+        prompt: str,
+        model: str = "haiku",
+        max_tokens: int = 2048,
+    ) -> str:
+        """
+        Query an LLM for semantic analysis of context chunks.
+
+        Args:
+            prompt: The prompt to send to the LLM
+            model: Model shorthand - "haiku", "sonnet", or "opus"
+            max_tokens: Maximum tokens in response
+
+        Returns:
+            The LLM's response text
+        """
+        global _llm_call_count, _llm_total_tokens
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY not set. Required for llm_query().\n"
+                "Set it with: export ANTHROPIC_API_KEY=your-key"
+            )
+
+        # Map shorthand to full model names
+        model_map = {
+            "haiku": "claude-3-5-haiku-20241022",
+            "sonnet": "claude-sonnet-4-20250514",
+            "opus": "claude-opus-4-20250514",
+        }
+        full_model = model_map.get(model, model)
+
+        try:
+            import anthropic
+        except ImportError:
+            raise RuntimeError(
+                "anthropic package not installed. Run: pip install anthropic"
+            )
+
+        client = anthropic.Anthropic(api_key=api_key)
+
+        _llm_call_count += 1
+        print(f"[LLM Call #{_llm_call_count}] Model: {full_model}, Prompt: {len(prompt)} chars")
+
+        try:
+            response = client.messages.create(
+                model=full_model,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            result = response.content[0].text
+            tokens_used = response.usage.input_tokens + response.usage.output_tokens
+            _llm_total_tokens += tokens_used
+
+            print(f"[LLM Response] {tokens_used} tokens, {len(result)} chars")
+            return result
+
+        except Exception as e:
+            print(f"[LLM ERROR] {type(e).__name__}: {e}")
+            raise
+
+    return llm_query
+
+
+def get_llm_stats() -> dict:
+    """Return LLM usage statistics for the session."""
+    return {
+        "calls": _llm_call_count,
+        "total_tokens": _llm_total_tokens,
+    }
+
+
+def reset_llm_stats() -> None:
+    """Reset LLM usage statistics."""
+    global _llm_call_count, _llm_total_tokens
+    _llm_call_count = 0
+    _llm_total_tokens = 0
 
 
 def get_session_path(session_id: str) -> Path:
@@ -60,13 +159,31 @@ def save_session(session_id: str, state: dict) -> None:
         json.dump(state, f, indent=2, default=str)
 
 
-def create_execution_namespace(context: str, variables: dict) -> dict:
-    """Create the execution namespace with context."""
+def create_execution_namespace(
+    context: str,
+    variables: dict,
+    session_id: str = "",
+    enable_llm: bool = False,
+) -> dict:
+    """Create the execution namespace with context and optional LLM support."""
     namespace = {
         "context": context,
         "print": print,
         "__builtins__": __builtins__,
+        "get_llm_stats": get_llm_stats,
     }
+
+    if enable_llm:
+        namespace["llm_query"] = create_llm_query_function(session_id)
+    else:
+        # Provide a stub that gives a helpful error
+        def llm_query_stub(*args, **kwargs):
+            raise RuntimeError(
+                "llm_query() not enabled. Run exec with --llm flag:\n"
+                "  python rlm_repl.py exec <session> '<code>' --llm"
+            )
+        namespace["llm_query"] = llm_query_stub
+
     # Add any persisted variables from previous executions
     namespace.update(variables)
     return namespace
@@ -196,6 +313,7 @@ def cmd_exec(args):
     """Execute code in an existing session."""
     session_id = args.session_id
     code = args.code
+    enable_llm = getattr(args, "llm", False)
 
     # Load session
     try:
@@ -204,10 +322,16 @@ def cmd_exec(args):
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Reset LLM stats for this execution
+    if enable_llm:
+        reset_llm_stats()
+
     # Create execution namespace
     namespace = create_execution_namespace(
         state["context"],
-        state.get("variables", {})
+        state.get("variables", {}),
+        session_id=session_id,
+        enable_llm=enable_llm,
     )
 
     # Execute code
@@ -250,6 +374,12 @@ def cmd_exec(args):
         elif result_type == "ERROR":
             print(f"Error: {result_data[0]}")
         print(f"{'='*50}")
+
+    # Print LLM usage stats if enabled
+    if enable_llm:
+        stats = get_llm_stats()
+        if stats["calls"] > 0:
+            print(f"\n[LLM Usage] {stats['calls']} calls, {stats['total_tokens']:,} tokens")
 
 
 def cmd_info(args):
@@ -306,6 +436,92 @@ def cmd_cleanup(args):
         print(f"Session {session_id} not found")
 
 
+def cmd_init_dir(args):
+    """Initialize a new RLM session from a directory of files."""
+    directory = Path(args.directory).expanduser().resolve()
+    glob_pattern = args.glob or "**/*"
+    exclude_patterns = (args.exclude or "").split(",") if args.exclude else []
+
+    if not directory.exists():
+        print(f"[ERROR] Directory not found: {directory}", file=sys.stderr)
+        sys.exit(1)
+
+    if not directory.is_dir():
+        print(f"[ERROR] Not a directory: {directory}", file=sys.stderr)
+        sys.exit(1)
+
+    # Collect matching files
+    files_found = []
+    for path in directory.glob(glob_pattern):
+        if path.is_file():
+            # Check exclusions
+            rel_path = str(path.relative_to(directory))
+            if any(fnmatch.fnmatch(rel_path, excl.strip()) for excl in exclude_patterns if excl.strip()):
+                continue
+            # Skip common non-text files
+            if path.suffix.lower() in (".pyc", ".pyo", ".so", ".dll", ".exe", ".bin", ".png", ".jpg", ".gif", ".pdf"):
+                continue
+            # Skip hidden and cache directories
+            if any(part.startswith(".") or part == "__pycache__" or part == "node_modules" for part in path.parts):
+                continue
+            files_found.append(path)
+
+    if not files_found:
+        print(f"[ERROR] No files matched pattern '{glob_pattern}' in {directory}", file=sys.stderr)
+        sys.exit(1)
+
+    # Sort for consistent ordering
+    files_found.sort()
+
+    # Combine files into context
+    context_parts = []
+    for file_path in files_found:
+        try:
+            rel_path = file_path.relative_to(directory)
+            with open(file_path, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            context_parts.append(f"=== FILE: {rel_path} ===\n{content}\n")
+        except Exception as e:
+            print(f"[WARN] Skipping {file_path}: {e}", file=sys.stderr)
+
+    context = "\n".join(context_parts)
+
+    # Generate session ID
+    session_id = args.session or str(uuid.uuid4())[:8]
+
+    # Create session state
+    state = {
+        "session_id": session_id,
+        "context_file": str(directory),
+        "context_length": len(context),
+        "context_type": "directory",
+        "files_count": len(files_found),
+        "glob_pattern": glob_pattern,
+        "context": context,
+        "variables": {},
+        "iteration": 0,
+        "history": [],
+    }
+
+    save_session(session_id, state)
+
+    # Output session info
+    print(f"RLM Session Initialized (Directory Mode)")
+    print(f"Session ID: {session_id}")
+    print(f"Directory: {directory}")
+    print(f"Pattern: {glob_pattern}")
+    print(f"Files: {len(files_found)}")
+    print(f"Context: {len(context):,} characters")
+    print(f"")
+    print(f"Available in REPL:")
+    print(f"  - context: Combined file contents ({len(context):,} chars)")
+    print(f"  - llm_query(prompt, model): LLM calls (with --llm flag)")
+    print(f"")
+    print(f"Commands:")
+    print(f"  exec {session_id} \"<code>\" --llm  - Execute with LLM support")
+    print(f"  info {session_id}  - Show session info")
+
+
 def cmd_list(args):
     """List all active sessions."""
     sessions = list(SESSION_DIR.glob("*.json"))
@@ -336,15 +552,24 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # init command
-    init_parser = subparsers.add_parser("init", help="Initialize new session")
+    init_parser = subparsers.add_parser("init", help="Initialize new session from file")
     init_parser.add_argument("context_file", help="Path to context file")
     init_parser.add_argument("--session", help="Custom session ID")
     init_parser.set_defaults(func=cmd_init)
+
+    # init-dir command
+    init_dir_parser = subparsers.add_parser("init-dir", help="Initialize session from directory")
+    init_dir_parser.add_argument("directory", help="Path to directory")
+    init_dir_parser.add_argument("--glob", default="**/*.py", help="Glob pattern (default: **/*.py)")
+    init_dir_parser.add_argument("--exclude", help="Comma-separated exclusion patterns")
+    init_dir_parser.add_argument("--session", help="Custom session ID")
+    init_dir_parser.set_defaults(func=cmd_init_dir)
 
     # exec command
     exec_parser = subparsers.add_parser("exec", help="Execute code in session")
     exec_parser.add_argument("session_id", help="Session ID")
     exec_parser.add_argument("code", help="Python code to execute")
+    exec_parser.add_argument("--llm", action="store_true", help="Enable llm_query() for API calls")
     exec_parser.set_defaults(func=cmd_exec)
 
     # info command
